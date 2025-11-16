@@ -6,24 +6,24 @@ release:
 
 deps:
 	# Update all dependencies to their latest versions
-	GOPRIVATE=github.com/CTG-Tech/* go get -u ./...
+	GOPRIVATE=github.com/rsmrtk/* go get -u ./...
 	# Tidy up the go.mod and go.sum files
 	go mod tidy
 
 mgen-all-new:
 	# Generate the models from the database
-	GOPRIVATE=github.com/Cery-Tech/* && go install github.com/Cery-Tech/db-model-generator@latest
+	GOPRIVATE=github.com/Cery-Tech/* && go install github.com/rsmrtk/db-fd-model-generator@latest
 	db-model-generator -c -n
 	go mod tidy
 
 mgen-all:
 	# Generate the models from the database
-	GOPRIVATE=github.com/CTG-Tech/* && go install github.com/CTG-Tech/db-model-generator@latest
+	GOPRIVATE=github.com/rsmrtk/* && go install github.com/rsmrtk/db-fd-model-generator@latest
 	db-model-generator -c
 	go mod tidy
 
 mgen:
 	# Generate the models from the database
-	GOPRIVATE=github.com/CTG-Tech/* && go install github.com/CTG-Tech/db-model-generator@latest
+	GOPRIVATE=github.com/rsmrtk/* && go install github.com/CTG-Tech/db-fd-model-generator@latest
 	db-model-generator
 	go mod tidy
