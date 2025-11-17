@@ -1,12 +1,13 @@
-package db_jurny_rider_model
+package db_fd_model
 
 import (
 	"context"
 	"fmt"
 
 	"cloud.google.com/go/spanner"
+	"github.com/rsmrtk/db-fd-model/m_income"
 	"github.com/rsmrtk/db-fd-model/m_options"
-	"github.com/rsmrtk/smartlg/logger"
+	"github.com/rsmrtk/log/logger"
 )
 
 var (
@@ -23,6 +24,7 @@ var (
 type Model struct {
 	DB *spanner.Client
 	//
+	Income *m_income.Facade
 }
 
 type Options struct {
@@ -52,6 +54,7 @@ func New(ctx context.Context, o *Options) (*Model, error) {
 	return &Model{
 		DB: db,
 		//
+		Income: m_income.New(opt),
 	}, nil
 }
 
