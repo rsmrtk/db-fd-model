@@ -68,21 +68,21 @@ const (
 	CreatedAt    Field = "created_at"
 )
 
-type EnumStatus string
+type EnumType string
 
 const (
-	EnumStatusSalary   EnumStatus = "salary"
-	EnumStatusTransfer EnumStatus = "transfer"
-	EnumStatusOthers   EnumStatus = "others"
+	EnumTypeSalary   EnumType = "salary"
+	EnumTypeTransfer EnumType = "transfer"
+	EnumTypeOthers   EnumType = "others"
 )
 
-func (e EnumStatus) String() string {
+func (e EnumType) String() string {
 	return string(e)
 }
 
-func (e *EnumStatus) IsValid() bool {
+func (e *EnumType) IsValid() bool {
 	switch *e {
-	case EnumStatusSalary, EnumStatusTransfer, EnumStatusOthers:
+	case EnumTypeSalary, EnumTypeTransfer, EnumTypeOthers:
 		return true
 	}
 	return false
