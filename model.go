@@ -7,7 +7,7 @@ import (
 	"cloud.google.com/go/spanner"
 	"github.com/rsmrtk/db-fd-model/m_income"
 	"github.com/rsmrtk/db-fd-model/m_options"
-	"github.com/rsmrtk/log/logger"
+	"github.com/rsmrtk/smartlg/logger"
 )
 
 var (
