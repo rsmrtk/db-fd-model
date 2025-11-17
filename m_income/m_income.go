@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
-	"cloud.google.com/go/spanner"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rsmrtk/db-fd-model/m_options"
 	"github.com/rsmrtk/db-fd-model/sql_builder"
 	"github.com/rsmrtk/smartlg/logger"
@@ -21,7 +23,7 @@ const (
 
 type Facade struct {
 	log *logger.Logger
-	db  *spanner.Client
+	db  *pgxpool.Pool
 	//
 }
 
@@ -39,11 +41,11 @@ func (f *Facade) logError(functionName string, msg string, h logger.H) {
 
 type Data struct {
 	IncomeID     string
-	IncomeName   spanner.NullString
-	IncomeAmount spanner.NullNumeric
-	IncomeType   spanner.NullString
-	IncomeDate   spanner.NullTime
-	CreatedAt    spanner.NullTime
+	IncomeName   *string
+	IncomeAmount *float64
+	IncomeType   *string
+	IncomeDate   *time.Time
+	CreatedAt    *time.Time
 }
 
 func (data *Data) Map() map[string]any {
@@ -184,7 +186,7 @@ type QueryParam struct {
 func makeStringFields(fields []Field) []string {
 	stringFields := make([]string, len(fields))
 	for i, f := range fields {
-		stringFields[i] = "`" + string(f) + "`"
+		stringFields[i] = string(f)
 	}
 
 	return stringFields
@@ -219,14 +221,15 @@ func ConstructWhereClause(queryParams []QueryParam) (whereClause string, params 
 		paramName := builder.String()
 		builder.Reset()
 
-		// Construct param
-		builder.WriteString("@")
-		builder.WriteString(paramName)
+		// Construct param - PostgreSQL uses $N syntax
+		builder.WriteString("$")
+		builder.WriteString(strconv.Itoa(i + 1))
 		param := builder.String()
 		builder.Reset()
 
 		if qp.Operator == "IN" {
-			builder.WriteString("UNNEST(")
+			// PostgreSQL uses = ANY($N) instead of IN UNNEST(@param)
+			builder.WriteString("= ANY(")
 			builder.WriteString(param)
 			builder.WriteString(")")
 			param = builder.String()
@@ -234,9 +237,7 @@ func ConstructWhereClause(queryParams []QueryParam) (whereClause string, params 
 		}
 
 		// Construct whereClause
-		builder.WriteString("`")
 		builder.WriteString(string(qp.Field))
-		builder.WriteString("`")
 		builder.WriteString(" ")
 		builder.WriteString(string(qp.Operator))
 		builder.WriteString(" ")
@@ -250,22 +251,32 @@ func ConstructWhereClause(queryParams []QueryParam) (whereClause string, params 
 	return strings.Join(whereClauses, " AND "), params
 }
 
-func (f *Facade) CreateMut(data *Data) *spanner.Mutation {
-	return spanner.Insert(Table, GetColumns(), GetValues(data))
-}
-
-func (f *Facade) CreateOrUpdateMut(data *Data) *spanner.Mutation {
-	return spanner.InsertOrUpdate(Table, GetColumns(), GetValues(data))
-}
-
 func (f *Facade) CreateOrUpdate(
 	ctx context.Context,
 	data *Data,
 ) error {
-	mutation := f.CreateOrUpdateMut(data)
+	query := fmt.Sprintf(`
+		INSERT INTO %s (%s)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (%s) DO UPDATE SET
+			%s = EXCLUDED.%s,
+			%s = EXCLUDED.%s,
+			%s = EXCLUDED.%s,
+			%s = EXCLUDED.%s,
+			%s = EXCLUDED.%s
+	`, Table,
+		strings.Join(allStringFields, ", "),
+		IncomeID,
+		IncomeName, IncomeName,
+		IncomeAmount, IncomeAmount,
+		IncomeType, IncomeType,
+		IncomeDate, IncomeDate,
+		CreatedAt, CreatedAt,
+	)
 
-	if _, err := f.db.Apply(ctx, []*spanner.Mutation{mutation}); err != nil {
-		f.logError("CreateOrUpdate", "Failed to Apply", logger.H{
+	_, err := f.db.Exec(ctx, query, GetValues(data)...)
+	if err != nil {
+		f.logError("CreateOrUpdate", "Failed to Exec", logger.H{
 			"error": err,
 			"data":  data,
 		})
@@ -276,10 +287,12 @@ func (f *Facade) CreateOrUpdate(
 }
 
 func (f *Facade) Create(ctx context.Context, data *Data) error {
-	mutation := f.CreateMut(data)
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES ($1, $2, $3, $4, $5, $6)",
+		Table, strings.Join(allStringFields, ", "))
 
-	if _, err := f.db.Apply(ctx, []*spanner.Mutation{mutation}); err != nil {
-		f.logError("Create", "Failed to Apply", logger.H{
+	_, err := f.db.Exec(ctx, query, GetValues(data)...)
+	if err != nil {
+		f.logError("Create", "Failed to Exec", logger.H{
 			"error": err,
 			"data":  data,
 		})
@@ -293,30 +306,20 @@ func (f *Facade) Exists(
 	ctx context.Context,
 	incomeID string,
 ) bool {
-	_, err := f.db.Single().ReadRow(
-		ctx,
-		Table,
-		spanner.Key{
-			incomeID,
-		},
-		[]string{string(ID)},
-	)
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1", ID, Table, ID)
+	var id string
+	err := f.db.QueryRow(ctx, query, incomeID).Scan(&id)
 	return err == nil
 }
 
 func (f *Facade) ExistsRtx(
 	ctx context.Context,
-	tx *spanner.ReadOnlyTransaction,
+	tx pgx.Tx,
 	incomeID string,
 ) bool {
-	_, err := tx.ReadRow(
-		ctx,
-		Table,
-		spanner.Key{
-			incomeID,
-		},
-		[]string{string(ID)},
-	)
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1", ID, Table, ID)
+	var id string
+	err := tx.QueryRow(ctx, query, incomeID).Scan(&id)
 	return err == nil
 }
 
@@ -332,32 +335,39 @@ func (f *Facade) Get(
 		queryString += " WHERE " + whereClauses
 	}
 
-	stmt := spanner.Statement{
-		SQL:    queryString,
-		Params: params,
+	// Convert map params to ordered slice
+	args := make([]interface{}, len(params))
+	for i := 0; i < len(params); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args[i] = params[paramName]
 	}
 
-	iter := f.db.Single().Query(ctx, stmt)
-	defer iter.Stop()
+	rows, err := f.db.Query(ctx, queryString, args...)
+	if err != nil {
+		f.logError("Get", "Failed to Query", logger.H{
+			"error":        err,
+			"query_params": queryParams,
+			"fields":       fields,
+		})
+		return nil, err
+	}
+	defer rows.Close()
 
-	res := make([]*Data, 0, iter.RowCount)
-
-	if err := iter.Do(func(row *spanner.Row) error {
+	var res []*Data
+	for rows.Next() {
 		var data Data
-
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			f.logError("Get", "Failed to Scan", logger.H{
 				"error":        err,
 				"query_params": queryParams,
 				"fields":       fields,
 			})
-			return err
+			return nil, err
 		}
-
 		res = append(res, &data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -366,7 +376,7 @@ func (f *Facade) Get(
 
 func (f *Facade) GetRtx(
 	ctx context.Context,
-	rtx *spanner.ReadOnlyTransaction,
+	rtx pgx.Tx,
 	queryParams []QueryParam,
 	fields []Field,
 ) ([]*Data, error) {
@@ -377,31 +387,39 @@ func (f *Facade) GetRtx(
 		queryString += " WHERE " + whereClauses
 	}
 
-	stmt := spanner.Statement{
-		SQL:    queryString,
-		Params: params,
+	// Convert map params to ordered slice
+	args := make([]interface{}, len(params))
+	for i := 0; i < len(params); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args[i] = params[paramName]
 	}
-	iter := rtx.Query(ctx, stmt)
-	defer iter.Stop()
 
-	res := make([]*Data, 0, iter.RowCount)
+	rows, err := rtx.Query(ctx, queryString, args...)
+	if err != nil {
+		f.logError("GetRtx", "Failed to Query", logger.H{
+			"error":        err,
+			"query_params": queryParams,
+			"fields":       fields,
+		})
+		return nil, err
+	}
+	defer rows.Close()
 
-	if err := iter.Do(func(row *spanner.Row) error {
+	var res []*Data
+	for rows.Next() {
 		var data Data
-
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
-			f.logError("Get", "Failed to Scan", logger.H{
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
+			f.logError("GetRtx", "Failed to Scan", logger.H{
 				"error":        err,
 				"query_params": queryParams,
 				"fields":       fields,
 			})
-			return err
+			return nil, err
 		}
-
 		res = append(res, &data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -413,33 +431,14 @@ func (f *Facade) Find(
 	incomeID string,
 	fields []Field,
 ) (*Data, error) {
-	stringFields := make([]string, len(fields))
-	for i, f := range fields {
-		stringFields[i] = string(f)
-	}
-
-	row, err := f.db.Single().ReadRow(
-		ctx,
-		Table,
-		spanner.Key{
-			incomeID,
-		},
-		stringFields,
-	)
-	if err != nil {
-		f.logError("Find", "Failed to ReadRow", logger.H{
-			"error":     err,
-			"income_id": incomeID,
-			"fields":    fields,
-		})
-		return nil, err
-	}
+	stringFields := makeStringFields(fields)
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1",
+		strings.Join(stringFields, ", "), Table, IncomeID)
 
 	var data Data
-
-	err = row.Columns(data.fieldPtrs(fields)...)
+	err := f.db.QueryRow(ctx, query, incomeID).Scan(data.fieldPtrs(fields)...)
 	if err != nil {
-		f.logError("Find", "Failed to Scan", logger.H{
+		f.logError("Find", "Failed to QueryRow", logger.H{
 			"error":     err,
 			"income_id": incomeID,
 			"fields":    fields,
@@ -452,37 +451,18 @@ func (f *Facade) Find(
 
 func (f *Facade) FindRtx(
 	ctx context.Context,
-	rtx *spanner.ReadOnlyTransaction,
+	rtx pgx.Tx,
 	incomeID string,
 	fields []Field,
 ) (*Data, error) {
-	stringFields := make([]string, len(fields))
-	for i, f := range fields {
-		stringFields[i] = string(f)
-	}
-
-	row, err := rtx.ReadRow(
-		ctx,
-		Table,
-		spanner.Key{
-			incomeID,
-		},
-		stringFields,
-	)
-	if err != nil {
-		f.logError("Find", "Failed to ReadRow", logger.H{
-			"error":     err,
-			"income_id": incomeID,
-			"fields":    fields,
-		})
-		return nil, err
-	}
+	stringFields := makeStringFields(fields)
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1",
+		strings.Join(stringFields, ", "), Table, IncomeID)
 
 	var data Data
-
-	err = row.Columns(data.fieldPtrs(fields)...)
+	err := rtx.QueryRow(ctx, query, incomeID).Scan(data.fieldPtrs(fields)...)
 	if err != nil {
-		f.logError("Find", "Failed to Scan", logger.H{
+		f.logError("FindRtx", "Failed to QueryRow", logger.H{
 			"error":     err,
 			"income_id": incomeID,
 			"fields":    fields,
@@ -502,7 +482,7 @@ func (f *Facade) Retrieve(
 
 func (f *Facade) RetrieveRtx(
 	ctx context.Context,
-	rtx *spanner.ReadOnlyTransaction,
+	rtx pgx.Tx,
 	incomeID string,
 ) (*Data, error) {
 	return f.FindRtx(ctx, rtx, incomeID, allFieldsList)
@@ -510,13 +490,15 @@ func (f *Facade) RetrieveRtx(
 
 func (f *Facade) CreateTx(
 	ctx context.Context,
-	tx *spanner.ReadWriteTransaction,
+	tx pgx.Tx,
 	data *Data,
 ) error {
-	mut := spanner.Insert(Table, GetColumns(), GetValues(data))
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES ($1, $2, $3, $4, $5, $6)",
+		Table, strings.Join(allStringFields, ", "))
 
-	if err := tx.BufferWrite([]*spanner.Mutation{mut}); err != nil {
-		f.logError("CreateTx", "Failed to BufferWrite", logger.H{
+	_, err := tx.Exec(ctx, query, GetValues(data)...)
+	if err != nil {
+		f.logError("CreateTx", "Failed to Exec", logger.H{
 			"error": err, "data": data,
 		})
 		return err
@@ -526,17 +508,31 @@ func (f *Facade) CreateTx(
 
 func (f *Facade) UpdateTx(
 	ctx context.Context,
-	tx *spanner.ReadWriteTransaction,
+	tx pgx.Tx,
 	incomeID string,
 	data UpdateFields,
 ) error {
-	mut := f.UpdateMut(
-		incomeID,
-		data,
-	)
+	if len(data) == 0 {
+		return nil
+	}
 
-	if err := tx.BufferWrite([]*spanner.Mutation{mut}); err != nil {
-		f.logError("UpdateTx", "Failed to BufferWrite", logger.H{
+	setClauses := make([]string, 0, len(data))
+	args := make([]interface{}, 0, len(data)+1)
+	paramIdx := 1
+
+	for field, value := range data {
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", field, paramIdx))
+		args = append(args, value)
+		paramIdx++
+	}
+	args = append(args, incomeID)
+
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s = $%d",
+		Table, strings.Join(setClauses, ", "), IncomeID, paramIdx)
+
+	_, err := tx.Exec(ctx, query, args...)
+	if err != nil {
+		f.logError("UpdateTx", "Failed to Exec", logger.H{
 			"error": err, "primaryKeys": map[string]interface{}{
 				"income_id": incomeID,
 			},
@@ -549,40 +545,26 @@ func (f *Facade) UpdateTx(
 
 func (f *Facade) FindTx(
 	ctx context.Context,
-	tx *spanner.ReadWriteTransaction,
+	tx pgx.Tx,
 	incomeID string,
 	fields []Field,
 ) (*Data, error) {
-	strCols := make([]string, len(fields))
-	for i, fld := range fields {
-		strCols[i] = string(fld)
-	}
+	stringFields := makeStringFields(fields)
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1",
+		strings.Join(stringFields, ", "), Table, IncomeID)
 
-	row, err := tx.ReadRow(
-		ctx,
-		Table,
-		spanner.Key{
-			incomeID,
-		},
-		strCols,
-	)
+	var data Data
+	err := tx.QueryRow(ctx, query, incomeID).Scan(data.fieldPtrs(fields)...)
 	if err != nil {
-		f.logError("FindTx", "Failed to ReadRow", logger.H{
+		f.logError("FindTx", "Failed to QueryRow", logger.H{
 			"error":     err,
 			"income_id": incomeID,
 			"fields":    fields,
 		})
 		return nil, err
 	}
-	var d Data
-	if err := row.Columns(d.fieldPtrs(fields)...); err != nil {
-		f.logError("FindTx", "Failed to Scan", logger.H{
-			"error":  err,
-			"fields": fields,
-		})
-		return nil, err
-	}
-	return &d, nil
+
+	return &data, nil
 }
 
 func (c *Facade) GetByBuilder(ctx context.Context, builder *sql_builder.Builder[Field]) ([]*Data, error) {
@@ -593,38 +575,37 @@ func (c *Facade) GetByBuilder(ctx context.Context, builder *sql_builder.Builder[
 	queryParams := builder.Params()
 	fields := builder.Fields()
 
-	stmt := spanner.Statement{
-		SQL:    queryStr,
-		Params: queryParams,
+	rows, err := c.db.Query(ctx, queryStr, queryParams...)
+	if err != nil {
+		c.logError("GetByBuilder", "Failed to Query", logger.H{
+			"error":  err,
+			"fields": fields,
+		})
+		return nil, err
 	}
+	defer rows.Close()
 
-	iter := c.db.Single().Query(ctx, stmt)
-	defer iter.Stop()
-
-	res := make([]*Data, 0, iter.RowCount)
-
-	if err := iter.Do(func(row *spanner.Row) error {
+	var res []*Data
+	for rows.Next() {
 		var data Data
-
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			c.logError("GetByBuilder", "Failed to Scan", logger.H{
 				"error":  err,
 				"fields": fields,
 			})
-			return err
+			return nil, err
 		}
-
 		res = append(res, &data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
 	return res, nil
 }
 
-func (c *Facade) GetByBuilderRtx(ctx context.Context, rtx *spanner.ReadOnlyTransaction, builder *sql_builder.Builder[Field]) ([]*Data, error) {
+func (c *Facade) GetByBuilderRtx(ctx context.Context, rtx pgx.Tx, builder *sql_builder.Builder[Field]) ([]*Data, error) {
 	if builder == nil {
 		return nil, fmt.Errorf("builder cannot be nil")
 	}
@@ -632,38 +613,37 @@ func (c *Facade) GetByBuilderRtx(ctx context.Context, rtx *spanner.ReadOnlyTrans
 	queryParams := builder.Params()
 	fields := builder.Fields()
 
-	stmt := spanner.Statement{
-		SQL:    queryStr,
-		Params: queryParams,
+	rows, err := rtx.Query(ctx, queryStr, queryParams...)
+	if err != nil {
+		c.logError("GetByBuilderRtx", "Failed to Query", logger.H{
+			"error":  err,
+			"fields": fields,
+		})
+		return nil, err
 	}
+	defer rows.Close()
 
-	iter := rtx.Query(ctx, stmt)
-	defer iter.Stop()
-
-	res := make([]*Data, 0, iter.RowCount)
-
-	if err := iter.Do(func(row *spanner.Row) error {
+	var res []*Data
+	for rows.Next() {
 		var data Data
-
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			c.logError("GetByBuilderRtx", "Failed to Scan", logger.H{
 				"error":  err,
 				"fields": fields,
 			})
-			return err
+			return nil, err
 		}
-
 		res = append(res, &data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
 	return res, nil
 }
 
-func (c *Facade) GetByBuilderTx(ctx context.Context, tx *spanner.ReadWriteTransaction, builder *sql_builder.Builder[Field]) ([]*Data, error) {
+func (c *Facade) GetByBuilderTx(ctx context.Context, tx pgx.Tx, builder *sql_builder.Builder[Field]) ([]*Data, error) {
 	if builder == nil {
 		return nil, fmt.Errorf("builder cannot be nil")
 	}
@@ -671,31 +651,30 @@ func (c *Facade) GetByBuilderTx(ctx context.Context, tx *spanner.ReadWriteTransa
 	queryParams := builder.Params()
 	fields := builder.Fields()
 
-	stmt := spanner.Statement{
-		SQL:    queryStr,
-		Params: queryParams,
+	rows, err := tx.Query(ctx, queryStr, queryParams...)
+	if err != nil {
+		c.logError("GetByBuilderTx", "Failed to Query", logger.H{
+			"error":  err,
+			"fields": fields,
+		})
+		return nil, err
 	}
+	defer rows.Close()
 
-	iter := tx.Query(ctx, stmt)
-	defer iter.Stop()
-
-	res := make([]*Data, 0, iter.RowCount)
-
-	if err := iter.Do(func(row *spanner.Row) error {
+	var res []*Data
+	for rows.Next() {
 		var data Data
-
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			c.logError("GetByBuilderTx", "Failed to Scan", logger.H{
 				"error":  err,
 				"fields": fields,
 			})
-			return err
+			return nil, err
 		}
-
 		res = append(res, &data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -710,33 +689,36 @@ func (c *Facade) GetByBuilderIter(ctx context.Context, builder *sql_builder.Buil
 	queryParams := builder.Params()
 	fields := builder.Fields()
 
-	stmt := spanner.Statement{
-		SQL:    queryStr,
-		Params: queryParams,
+	rows, err := c.db.Query(ctx, queryStr, queryParams...)
+	if err != nil {
+		c.logError("GetByBuilderIter", "Failed to Query", logger.H{
+			"error":  err,
+			"fields": fields,
+		})
+		return err
 	}
+	defer rows.Close()
 
-	if err := c.db.Single().Query(ctx, stmt).Do(func(row *spanner.Row) error {
+	for rows.Next() {
 		var data Data
-
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			c.logError("GetByBuilderIter", "Failed to Scan", logger.H{
 				"error":  err,
 				"fields": fields,
 			})
 			return err
 		}
-
 		callback(&data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (c *Facade) GetByBuilderRtxIter(ctx context.Context, rtx *spanner.ReadOnlyTransaction, builder *sql_builder.Builder[Field], callback func(*Data)) error {
+func (c *Facade) GetByBuilderRtxIter(ctx context.Context, rtx pgx.Tx, builder *sql_builder.Builder[Field], callback func(*Data)) error {
 	if builder == nil {
 		return fmt.Errorf("builder cannot be nil")
 	}
@@ -744,33 +726,36 @@ func (c *Facade) GetByBuilderRtxIter(ctx context.Context, rtx *spanner.ReadOnlyT
 	queryParams := builder.Params()
 	fields := builder.Fields()
 
-	stmt := spanner.Statement{
-		SQL:    queryStr,
-		Params: queryParams,
+	rows, err := rtx.Query(ctx, queryStr, queryParams...)
+	if err != nil {
+		c.logError("GetByBuilderRtxIter", "Failed to Query", logger.H{
+			"error":  err,
+			"fields": fields,
+		})
+		return err
 	}
+	defer rows.Close()
 
-	if err := rtx.Query(ctx, stmt).Do(func(row *spanner.Row) error {
+	for rows.Next() {
 		var data Data
-
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			c.logError("GetByBuilderRtxIter", "Failed to Scan", logger.H{
 				"error":  err,
 				"fields": fields,
 			})
 			return err
 		}
-
 		callback(&data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (c *Facade) GetByBuilderTxIter(ctx context.Context, tx *spanner.ReadWriteTransaction, builder *sql_builder.Builder[Field], callback func(*Data)) error {
+func (c *Facade) GetByBuilderTxIter(ctx context.Context, tx pgx.Tx, builder *sql_builder.Builder[Field], callback func(*Data)) error {
 	if builder == nil {
 		return fmt.Errorf("builder cannot be nil")
 	}
@@ -778,26 +763,29 @@ func (c *Facade) GetByBuilderTxIter(ctx context.Context, tx *spanner.ReadWriteTr
 	queryParams := builder.Params()
 	fields := builder.Fields()
 
-	stmt := spanner.Statement{
-		SQL:    queryStr,
-		Params: queryParams,
+	rows, err := tx.Query(ctx, queryStr, queryParams...)
+	if err != nil {
+		c.logError("GetByBuilderTxIter", "Failed to Query", logger.H{
+			"error":  err,
+			"fields": fields,
+		})
+		return err
 	}
+	defer rows.Close()
 
-	if err := tx.Query(ctx, stmt).Do(func(row *spanner.Row) error {
+	for rows.Next() {
 		var data Data
-
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			c.logError("GetByBuilderTxIter", "Failed to Scan", logger.H{
 				"error":  err,
 				"fields": fields,
 			})
 			return err
 		}
-
 		callback(&data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return err
 	}
 
@@ -806,7 +794,7 @@ func (c *Facade) GetByBuilderTxIter(ctx context.Context, tx *spanner.ReadWriteTr
 
 func (f *Facade) GetTx(
 	ctx context.Context,
-	tx *spanner.ReadWriteTransaction,
+	tx pgx.Tx,
 	queryParams []QueryParam,
 	fields []Field,
 ) ([]*Data, error) {
@@ -815,25 +803,40 @@ func (f *Facade) GetTx(
 	if len(queryParams) > 0 {
 		q += " WHERE " + whereClause
 	}
-	stmt := spanner.Statement{SQL: q, Params: params}
 
-	iter := tx.Query(ctx, stmt)
-	defer iter.Stop()
+	// Convert map params to ordered slice
+	args := make([]interface{}, len(params))
+	for i := 0; i < len(params); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args[i] = params[paramName]
+	}
+
+	rows, err := tx.Query(ctx, q, args...)
+	if err != nil {
+		f.logError("GetTx", "Failed to Query", logger.H{
+			"error":       err,
+			"queryParams": queryParams,
+			"fields":      fields,
+		})
+		return nil, err
+	}
+	defer rows.Close()
 
 	var res []*Data
-	if err := iter.Do(func(row *spanner.Row) error {
-		var d Data
-		if err := row.Columns(d.fieldPtrs(fields)...); err != nil {
+	for rows.Next() {
+		var data Data
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			f.logError("GetTx", "Failed to Scan", logger.H{
 				"error":       err,
 				"queryParams": queryParams,
 				"fields":      fields,
 			})
-			return err
+			return nil, err
 		}
-		res = append(res, &d)
-		return nil
-	}); err != nil {
+		res = append(res, &data)
+	}
+
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -842,17 +845,12 @@ func (f *Facade) GetTx(
 
 func (f *Facade) ExistTx(
 	ctx context.Context,
-	tx *spanner.ReadWriteTransaction,
+	tx pgx.Tx,
 	incomeID string,
 ) bool {
-	_, err := tx.ReadRow(
-		ctx,
-		Table,
-		spanner.Key{
-			incomeID,
-		},
-		[]string{string(ID)},
-	)
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1", ID, Table, ID)
+	var id string
+	err := tx.QueryRow(ctx, query, incomeID).Scan(&id)
 	return err == nil
 }
 
@@ -862,32 +860,32 @@ func (c *Facade) InitBuilder() *sql_builder.Builder[Field] {
 	return b
 }
 
-func (f *Facade) UpdateMut(
-	incomeID string,
-	data UpdateFields,
-) *spanner.Mutation {
-	mutationData := map[string]interface{}{
-		IncomeID.String(): incomeID,
-	}
-	for field, value := range data {
-		mutationData[field.String()] = value
-	}
-
-	return spanner.UpdateMap(Table, mutationData)
-}
-
 func (f *Facade) Update(
 	ctx context.Context,
 	incomeID string,
 	data UpdateFields,
 ) error {
-	mutation := f.UpdateMut(
-		incomeID,
-		data,
-	)
+	if len(data) == 0 {
+		return nil
+	}
 
-	if _, err := f.db.Apply(ctx, []*spanner.Mutation{mutation}); err != nil {
-		f.logError("Update", "Failed to Apply", logger.H{
+	setClauses := make([]string, 0, len(data))
+	args := make([]interface{}, 0, len(data)+1)
+	paramIdx := 1
+
+	for field, value := range data {
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", field, paramIdx))
+		args = append(args, value)
+		paramIdx++
+	}
+	args = append(args, incomeID)
+
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s = $%d",
+		Table, strings.Join(setClauses, ", "), IncomeID, paramIdx)
+
+	_, err := f.db.Exec(ctx, query, args...)
+	if err != nil {
+		f.logError("Update", "Failed to Exec", logger.H{
 			"error": err,
 			"data":  data,
 		})
@@ -902,42 +900,45 @@ func (f *Facade) UpdateByParams(
 	queryParams []QueryParam,
 	data UpdateFields,
 ) error {
-	// Construct SQL query
-	whereClauses, params := ConstructWhereClause(queryParams)
-	builder := strings.Builder{}
+	if len(data) == 0 {
+		return nil
+	}
+
+	// Construct WHERE clause
+	whereClauses, whereParams := ConstructWhereClause(queryParams)
+
+	// Build SET clause
 	setClauses := make([]string, 0, len(data))
-	// Construct SET clause
+	args := make([]interface{}, 0, len(data)+len(whereParams))
+	paramIdx := 1
+
+	// Add SET parameters
 	for field, value := range data {
-		builder.WriteString(string(field))
-		paramName := builder.String()
-		builder.Reset()
-
-		// Construct param
-		builder.WriteString("@")
-		builder.WriteString(paramName)
-		param := builder.String()
-		builder.Reset()
-
-		// Construct SET clause
-		builder.WriteString("`")
-		builder.WriteString(string(field))
-		builder.WriteString("` = ")
-		builder.WriteString(param)
-		setClause := builder.String()
-		setClauses = append(setClauses, setClause)
-		params[paramName] = value
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", field, paramIdx))
+		args = append(args, value)
+		paramIdx++
 	}
 
-	queryString := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
-		Table, strings.Join(setClauses, ", "), whereClauses)
-
-	stmt := spanner.Statement{
-		SQL:    queryString,
-		Params: params,
+	// Add WHERE parameters
+	for i := 0; i < len(whereParams); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args = append(args, whereParams[paramName])
 	}
 
-	if _, err := f.db.PartitionedUpdate(ctx, stmt); err != nil {
-		f.logError("UpdateByParams", "Failed to PartitionedUpdate", logger.H{
+	// Adjust WHERE clause to use correct parameter numbers
+	adjustedWhere := whereClauses
+	for i := len(data); i > 0; i-- {
+		adjustedWhere = strings.ReplaceAll(adjustedWhere,
+			fmt.Sprintf("$%d", i),
+			fmt.Sprintf("$%d", i+len(data)))
+	}
+
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
+		Table, strings.Join(setClauses, ", "), adjustedWhere)
+
+	_, err := f.db.Exec(ctx, query, args...)
+	if err != nil {
+		f.logError("UpdateByParams", "Failed to Exec", logger.H{
 			"error":        err,
 			"query_params": queryParams,
 			"data":         data,
@@ -948,24 +949,15 @@ func (f *Facade) UpdateByParams(
 	return nil
 }
 
-func (f *Facade) DeleteMut(
-	incomeID string,
-) *spanner.Mutation {
-	return spanner.Delete(Table, spanner.Key{
-		incomeID,
-	})
-}
-
 func (f *Facade) Delete(
 	ctx context.Context,
 	incomeID string,
 ) error {
-	mutation := f.DeleteMut(
-		incomeID,
-	)
+	query := fmt.Sprintf("DELETE FROM %s WHERE %s = $1", Table, IncomeID)
 
-	if _, err := f.db.Apply(ctx, []*spanner.Mutation{mutation}); err != nil {
-		f.logError("Delete", "Failed to Apply", logger.H{
+	_, err := f.db.Exec(ctx, query, incomeID)
+	if err != nil {
+		f.logError("Delete", "Failed to Exec", logger.H{
 			"error": err,
 		})
 		return fmt.Errorf("failed to delete file record: %w", err)
@@ -976,7 +968,7 @@ func (f *Facade) Delete(
 
 func (f *Facade) GetRtxIter(
 	ctx context.Context,
-	rtx *spanner.ReadOnlyTransaction,
+	rtx pgx.Tx,
 	queryParams []QueryParam,
 	fields []Field,
 	callback func(*Data),
@@ -988,12 +980,27 @@ func (f *Facade) GetRtxIter(
 		queryString += " WHERE " + whereClauses
 	}
 
-	if err := rtx.Query(ctx, spanner.Statement{
-		SQL:    queryString,
-		Params: params,
-	}).Do(func(row *spanner.Row) error {
+	// Convert map params to ordered slice
+	args := make([]interface{}, len(params))
+	for i := 0; i < len(params); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args[i] = params[paramName]
+	}
+
+	rows, err := rtx.Query(ctx, queryString, args...)
+	if err != nil {
+		f.logError("GetRtxIter", "Failed to Query", logger.H{
+			"error":        err,
+			"query_params": queryParams,
+			"fields":       fields,
+		})
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
 		var data Data
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			f.logError("GetRtxIter", "Failed to Scan", logger.H{
 				"error":        err,
 				"query_params": queryParams,
@@ -1001,11 +1008,10 @@ func (f *Facade) GetRtxIter(
 			})
 			return err
 		}
-
 		callback(&data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return err
 	}
 
@@ -1025,12 +1031,27 @@ func (f *Facade) GetIter(
 		queryString += " WHERE " + whereClauses
 	}
 
-	if err := f.db.Single().Query(ctx, spanner.Statement{
-		SQL:    queryString,
-		Params: params,
-	}).Do(func(row *spanner.Row) error {
+	// Convert map params to ordered slice
+	args := make([]interface{}, len(params))
+	for i := 0; i < len(params); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args[i] = params[paramName]
+	}
+
+	rows, err := f.db.Query(ctx, queryString, args...)
+	if err != nil {
+		f.logError("GetIter", "Failed to Query", logger.H{
+			"error":        err,
+			"query_params": queryParams,
+			"fields":       fields,
+		})
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
 		var data Data
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			f.logError("GetIter", "Failed to Scan", logger.H{
 				"error":        err,
 				"query_params": queryParams,
@@ -1038,11 +1059,10 @@ func (f *Facade) GetIter(
 			})
 			return err
 		}
-
 		callback(&data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return err
 	}
 
@@ -1054,37 +1074,43 @@ func (f *Facade) GetByPrimaryKeys(
 	primaryKeys []PrimaryKey,
 	fields []Field,
 ) ([]*Data, error) {
-	stringFields := make([]string, len(fields))
-	for i, f := range fields {
-		stringFields[i] = string(f)
+	if len(primaryKeys) == 0 {
+		return []*Data{}, nil
 	}
 
-	spk := make([]spanner.Key, len(primaryKeys))
+	stringFields := makeStringFields(fields)
+	incomeIDs := make([]string, len(primaryKeys))
 	for i, pk := range primaryKeys {
-		spk[i] = spanner.Key{
-			pk.IncomeID,
-		}
+		incomeIDs[i] = pk.IncomeID
 	}
 
-	iter := f.db.Single().Read(ctx, Table, spanner.KeySetFromKeys(spk...), stringFields)
-	defer iter.Stop()
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1)",
+		strings.Join(stringFields, ", "), Table, IncomeID)
+
+	rows, err := f.db.Query(ctx, query, incomeIDs)
+	if err != nil {
+		f.logError("GetByPrimaryKeys", "Failed to Query", logger.H{
+			"error":  err,
+			"fields": fields,
+		})
+		return nil, err
+	}
+	defer rows.Close()
 
 	var res []*Data
-	if err := iter.Do(func(row *spanner.Row) error {
+	for rows.Next() {
 		var data Data
-
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			f.logError("GetByPrimaryKeys", "Failed to Scan", logger.H{
 				"error":  err,
 				"fields": fields,
 			})
-			return err
+			return nil, err
 		}
-
 		res = append(res, &data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -1100,40 +1126,47 @@ func (f *Facade) ListByPrimaryKeys(
 
 func (f *Facade) GetByPrimaryKeysRtx(
 	ctx context.Context,
-	rtx *spanner.ReadOnlyTransaction,
+	rtx pgx.Tx,
 	primaryKeys []PrimaryKey,
 	fields []Field,
 ) ([]*Data, error) {
-	stringFields := make([]string, len(fields))
-	for i, f := range fields {
-		stringFields[i] = string(f)
+	if len(primaryKeys) == 0 {
+		return []*Data{}, nil
 	}
 
-	spk := make([]spanner.Key, len(primaryKeys))
+	stringFields := makeStringFields(fields)
+	incomeIDs := make([]string, len(primaryKeys))
 	for i, pk := range primaryKeys {
-		spk[i] = spanner.Key{
-			pk.IncomeID,
-		}
+		incomeIDs[i] = pk.IncomeID
 	}
 
-	iter := rtx.Read(ctx, Table, spanner.KeySetFromKeys(spk...), stringFields)
-	defer iter.Stop()
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1)",
+		strings.Join(stringFields, ", "), Table, IncomeID)
+
+	rows, err := rtx.Query(ctx, query, incomeIDs)
+	if err != nil {
+		f.logError("GetByPrimaryKeysRtx", "Failed to Query", logger.H{
+			"error":  err,
+			"fields": fields,
+		})
+		return nil, err
+	}
+	defer rows.Close()
 
 	var res []*Data
-	if err := iter.Do(func(row *spanner.Row) error {
+	for rows.Next() {
 		var data Data
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
-			f.logError("GetByPrimaryKeys", "Failed to Scan", logger.H{
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
+			f.logError("GetByPrimaryKeysRtx", "Failed to Scan", logger.H{
 				"error":  err,
 				"fields": fields,
 			})
-			return err
+			return nil, err
 		}
-
 		res = append(res, &data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -1142,38 +1175,47 @@ func (f *Facade) GetByPrimaryKeysRtx(
 
 func (f *Facade) GetByPrimaryKeysTx(
 	ctx context.Context,
-	tx *spanner.ReadWriteTransaction,
+	tx pgx.Tx,
 	primaryKeys []PrimaryKey,
 	fields []Field,
 ) ([]*Data, error) {
-	stringFields := make([]string, len(fields))
-	for i, fld := range fields {
-		stringFields[i] = string(fld)
+	if len(primaryKeys) == 0 {
+		return []*Data{}, nil
 	}
 
-	spk := make([]spanner.Key, len(primaryKeys))
+	stringFields := makeStringFields(fields)
+	incomeIDs := make([]string, len(primaryKeys))
 	for i, pk := range primaryKeys {
-		spk[i] = spanner.Key{
-			pk.IncomeID,
-		}
+		incomeIDs[i] = pk.IncomeID
 	}
 
-	iter := tx.Read(ctx, Table, spanner.KeySetFromKeys(spk...), stringFields)
-	defer iter.Stop()
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1)",
+		strings.Join(stringFields, ", "), Table, IncomeID)
+
+	rows, err := tx.Query(ctx, query, incomeIDs)
+	if err != nil {
+		f.logError("GetByPrimaryKeysTx", "Failed to Query", logger.H{
+			"error":  err,
+			"fields": fields,
+		})
+		return nil, err
+	}
+	defer rows.Close()
 
 	var res []*Data
-	if err := iter.Do(func(row *spanner.Row) error {
+	for rows.Next() {
 		var data Data
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			f.logError("GetByPrimaryKeysTx", "Failed to Scan", logger.H{
 				"error":  err,
 				"fields": fields,
 			})
-			return err
+			return nil, err
 		}
 		res = append(res, &data)
-		return nil
-	}); err != nil {
+	}
+
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -1182,7 +1224,7 @@ func (f *Facade) GetByPrimaryKeysTx(
 
 func (f *Facade) ListByPrimaryKeysRtx(
 	ctx context.Context,
-	rtx *spanner.ReadOnlyTransaction,
+	rtx pgx.Tx,
 	primaryKeys []PrimaryKey,
 ) ([]*Data, error) {
 	return f.GetByPrimaryKeysRtx(ctx, rtx, primaryKeys, allFieldsList)
@@ -1190,7 +1232,7 @@ func (f *Facade) ListByPrimaryKeysRtx(
 
 func (f *Facade) ListByPrimaryKeysTx(
 	ctx context.Context,
-	tx *spanner.ReadWriteTransaction,
+	tx pgx.Tx,
 	primaryKeys []PrimaryKey,
 ) ([]*Data, error) {
 	return f.GetByPrimaryKeysTx(ctx, tx, primaryKeys, allFieldsList)
@@ -1202,33 +1244,42 @@ func (f *Facade) GetByPrimaryKeysIter(
 	fields []Field,
 	callback func(*Data),
 ) error {
-	stringFields := make([]string, len(fields))
-	for i, f := range fields {
-		stringFields[i] = string(f)
+	if len(primaryKeys) == 0 {
+		return nil
 	}
 
-	spk := make([]spanner.Key, len(primaryKeys))
+	stringFields := makeStringFields(fields)
+	incomeIDs := make([]string, len(primaryKeys))
 	for i, pk := range primaryKeys {
-		spk[i] = spanner.Key{
-			pk.IncomeID,
-		}
+		incomeIDs[i] = pk.IncomeID
 	}
 
-	if err := f.db.Single().Read(ctx, Table, spanner.KeySetFromKeys(spk...), stringFields).Do(func(row *spanner.Row) error {
-		var data Data
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1)",
+		strings.Join(stringFields, ", "), Table, IncomeID)
 
-		if err := row.Columns(data.fieldPtrs(fields)...); err != nil {
+	rows, err := f.db.Query(ctx, query, incomeIDs)
+	if err != nil {
+		f.logError("GetByPrimaryKeysIter", "Failed to Query", logger.H{
+			"error":  err,
+			"fields": fields,
+		})
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var data Data
+		if err := rows.Scan(data.fieldPtrs(fields)...); err != nil {
 			f.logError("GetByPrimaryKeysIter", "Failed to Scan", logger.H{
 				"error":  err,
 				"fields": fields,
 			})
 			return err
 		}
-
 		callback(&data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return err
 	}
 
@@ -1252,7 +1303,7 @@ func (f *Facade) List(
 
 func (f *Facade) ListRtx(
 	ctx context.Context,
-	rtx *spanner.ReadOnlyTransaction,
+	rtx pgx.Tx,
 	queryParams []QueryParam,
 ) ([]*Data, error) {
 	return f.GetRtx(ctx, rtx, queryParams, allFieldsList)
@@ -1268,7 +1319,7 @@ func (f *Facade) ListIter(
 
 func (f *Facade) ListRtxIter(
 	ctx context.Context,
-	rtx *spanner.ReadOnlyTransaction,
+	rtx pgx.Tx,
 	queryParams []QueryParam,
 	callback func(*Data),
 ) error {
@@ -1292,17 +1343,13 @@ type OperationRead struct {
 	f         *Facade
 	fields    []Field
 	strFields []string
-	stmt      spanner.Statement
+	query     string
+	args      []interface{}
 	readtype  readtype
-	rtx       *spanner.ReadOnlyTransaction
-	tx        *spanner.ReadWriteTransaction
-	spk       []spanner.Key
-	keyrange  spanner.KeyRange
+	rtx       pgx.Tx
+	tx        pgx.Tx
 	params    []interface{}
 	qp        []QueryParam
-	singleKey spanner.Key
-	keyList   []spanner.Key
-	indxName  string
 	qb        *sql_builder.Builder[Field]
 }
 
@@ -1310,18 +1357,14 @@ func (op *OperationRead) Exists(
 	ctx context.Context,
 	incomeID string,
 ) bool {
-	tx := op.rtx
-	if tx == nil {
-		tx = op.f.db.Single()
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1", ID, Table, ID)
+	var id string
+	var err error
+	if op.rtx != nil {
+		err = op.rtx.QueryRow(ctx, query, incomeID).Scan(&id)
+	} else {
+		err = op.f.db.QueryRow(ctx, query, incomeID).Scan(&id)
 	}
-	_, err := tx.ReadRow(
-		ctx,
-		Table,
-		spanner.Key{
-			incomeID,
-		},
-		[]string{string(ID)},
-	)
 	return err == nil
 }
 
@@ -1336,43 +1379,33 @@ func (op *OperationRead) Columns(fields ...Field) *OperationRead {
 func (op *OperationRead) Params(queryParams []QueryParam) *OperationRead {
 	op.readtype = byParams
 	op.qp = queryParams
-
 	return op
 }
 
-func (op *OperationRead) Query(stmt spanner.Statement) *OperationRead {
+func (op *OperationRead) Query(query string, args ...interface{}) *OperationRead {
 	op.readtype = byQuery
-	op.stmt = stmt
+	op.query = query
+	op.args = args
 	return op
 }
 
-func (op *OperationRead) Rtx(rtx *spanner.ReadOnlyTransaction) *OperationRead {
+func (op *OperationRead) Rtx(rtx pgx.Tx) *OperationRead {
 	op.rtx = rtx
 	return op
 }
 
-func (op *OperationRead) Tx(tx *spanner.ReadWriteTransaction) *OperationRead {
+func (op *OperationRead) Tx(tx pgx.Tx) *OperationRead {
 	op.tx = tx
 	return op
 }
 
 func (op *OperationRead) ByKeys(primaryKeys []PrimaryKey) *OperationRead {
-	spk := make([]spanner.Key, len(primaryKeys))
+	incomeIDs := make([]string, len(primaryKeys))
 	for i, pk := range primaryKeys {
-		spk[i] = spanner.Key{
-			pk.IncomeID,
-		}
+		incomeIDs[i] = pk.IncomeID
 	}
 	op.readtype = byKeys
-	op.spk = spk
-	return op
-}
-
-// If you do not provide columns via Columns method, by default it will select only columns which are primary keys
-func (op *OperationRead) ByIndexKeyList(indexName string, keys []spanner.Key) *OperationRead {
-	op.readtype = byIndexes
-	op.indxName = indexName
-	op.keyList = keys
+	op.args = []interface{}{incomeIDs}
 	return op
 }
 
@@ -1433,154 +1466,147 @@ func (op *OperationRead) GetCount(ctx context.Context) (int64, error) {
 	if op.qb == nil {
 		op.SelectCount()
 	}
-	if op.rtx == nil {
-		op.rtx = op.f.db.Single()
-	}
-	iter := op.rtx.Query(ctx, spanner.Statement{
-		SQL:    op.qb.String(),
-		Params: op.qb.Params(),
-	})
-	defer iter.Stop()
+
+	queryStr := op.qb.String()
+	queryParams := op.qb.Params()
 
 	var count int64
-	if err := iter.Do(func(row *spanner.Row) error {
-		if err := row.Columns(&count); err != nil {
-			op.f.logError("GetCount", "Failed to Scan", logger.H{
-				"error": err,
-				"query": op.qb.String(),
-				"param": op.qb.Params(),
-			})
-			return err
-		}
-		return nil
-	}); err != nil {
+	var err error
+	if op.rtx != nil {
+		err = op.rtx.QueryRow(ctx, queryStr, queryParams...).Scan(&count)
+	} else {
+		err = op.f.db.QueryRow(ctx, queryStr, queryParams...).Scan(&count)
+	}
+
+	if err != nil {
+		op.f.logError("GetCount", "Failed to Scan", logger.H{
+			"error": err,
+			"query": queryStr,
+			"param": queryParams,
+		})
 		return 0, err
 	}
 
 	return count, nil
 }
 
-func (op *OperationRead) Iterator(ctx context.Context) *spanner.RowIterator {
-	defer op.qb.Reset()
-	if op.rtx == nil {
-		op.rtx = op.f.db.Single()
-	}
+func (op *OperationRead) Rows(ctx context.Context) ([]*Data, error) {
+	op.stringColumns()
+
+	var rows pgx.Rows
+	var err error
+
 	switch op.readtype {
 	case byKeys:
-		op.params = []interface{}{op.spk}
-		op.stringColumns()
-		return op.rtx.Read(ctx, Table, spanner.KeySetFromKeys(op.spk...), op.strFields)
-	case byRange:
-		op.params = []interface{}{op.keyrange}
-		op.stringColumns()
-		return op.rtx.Read(ctx, Table, op.keyrange, op.strFields)
+		query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ANY($1)",
+			strings.Join(op.strFields, ", "), Table, IncomeID)
+		if op.rtx != nil {
+			rows, err = op.rtx.Query(ctx, query, op.args...)
+		} else {
+			rows, err = op.f.db.Query(ctx, query, op.args...)
+		}
 	case byQuery:
-		op.params = []interface{}{op.stmt}
-		op.stringColumns()
-		return op.rtx.Query(ctx, op.stmt)
-	case byIndex:
-		op.params = []interface{}{op.singleKey}
-		op.stringColumns()
-		return op.rtx.ReadUsingIndex(ctx, Table, op.indxName, op.singleKey, op.strFields)
-	case byIndexes:
-		op.params = []interface{}{op.keyList}
-		op.primaryColumns()
-		return op.rtx.ReadUsingIndex(ctx, Table, op.indxName, spanner.KeySetFromKeys(op.keyList...), op.strFields)
+		if op.rtx != nil {
+			rows, err = op.rtx.Query(ctx, op.query, op.args...)
+		} else {
+			rows, err = op.f.db.Query(ctx, op.query, op.args...)
+		}
 	case byBuilder:
-		op.stringColumns()
-		op.params = []interface{}{op.qb.Params()}
-		return op.rtx.Query(ctx, spanner.Statement{
-			SQL:    op.qb.String(),
-			Params: op.qb.Params(),
-		})
+		queryStr := op.qb.String()
+		queryParams := op.qb.Params()
+		if op.rtx != nil {
+			rows, err = op.rtx.Query(ctx, queryStr, queryParams...)
+		} else {
+			rows, err = op.f.db.Query(ctx, queryStr, queryParams...)
+		}
 	case byParams:
-		op.stringColumns()
 		queryString := SelectQuery(op.fields)
 		whereClauses, params := ConstructWhereClause(op.qp)
 		if op.qp != nil && len(op.qp) > 0 {
 			queryString += " WHERE " + whereClauses
 		}
-		op.params = []interface{}{op.qp}
-		return op.rtx.Query(ctx, spanner.Statement{
-			SQL:    queryString,
-			Params: params,
-		})
-	case byCounter:
-		panic("OperationRead Iterator: byCounter is not supported. Use GetCount instead")
-	default:
-		return nil
-	}
-}
-
-func (op *OperationRead) DoIter(ctx context.Context, callback func(*Data)) error {
-	withLog := func(row *spanner.Row) error {
-		var data Data
-		if err := row.Columns(data.fieldPtrs(op.fields)...); err != nil {
-			op.f.logError("OperationRead DoIter", "Failed to Scan", logger.H{
-				"error":        err,
-				"query_params": op.params,
-				"fields":       op.fields,
-			})
-			return err
+		args := make([]interface{}, len(params))
+		for i := 0; i < len(params); i++ {
+			paramName := fmt.Sprintf("param%d", i)
+			args[i] = params[paramName]
 		}
-
-		callback(&data)
-
-		return nil
+		if op.rtx != nil {
+			rows, err = op.rtx.Query(ctx, queryString, args...)
+		} else {
+			rows, err = op.f.db.Query(ctx, queryString, args...)
+		}
+	case byCounter:
+		return nil, fmt.Errorf("OperationRead Rows: byCounter is not supported. Use GetCount instead")
+	default:
+		return nil, fmt.Errorf("unsupported read type: %s", op.readtype)
 	}
 
-	if err := op.Iterator(ctx).Do(withLog); err != nil {
-		return err
+	if err != nil {
+		op.f.logError("OperationRead Rows", "Failed to Query", logger.H{
+			"error":        err,
+			"query_params": op.params,
+			"fields":       op.fields,
+		})
+		return nil, err
 	}
+	defer rows.Close()
 
-	return nil
-}
-
-func (op *OperationRead) Rows(ctx context.Context) ([]*Data, error) {
-	iter := op.Iterator(ctx)
-	defer iter.Stop()
-
-	res := make([]*Data, 0, iter.RowCount)
-
-	if err := iter.Do(func(row *spanner.Row) error {
+	var res []*Data
+	for rows.Next() {
 		var data Data
-		if err := row.Columns(data.fieldPtrs(op.fields)...); err != nil {
+		if err := rows.Scan(data.fieldPtrs(op.fields)...); err != nil {
 			op.f.logError("OperationRead Rows", "Failed to Scan", logger.H{
 				"error":        err,
 				"query_params": op.params,
 				"fields":       op.fields,
 			})
-			return err
+			return nil, err
 		}
-
 		res = append(res, &data)
+	}
 
-		return nil
-	}); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
 	return res, nil
 }
 
+func (op *OperationRead) DoIter(ctx context.Context, callback func(*Data)) error {
+	rows, err := op.Rows(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, row := range rows {
+		callback(row)
+	}
+
+	return nil
+}
+
 func (op *OperationRead) SingleRow(
 	ctx context.Context,
 	incomeID string,
 ) (*Data, error) {
-	if op.rtx == nil {
-		op.rtx = op.f.db.Single()
-	}
 	if len(op.fields) == 0 || len(op.fields) > len(allFieldsList) {
 		op.fields = allFieldsList
 	}
-	row, err := op.rtx.ReadRow(ctx, Table,
-		spanner.Key{
-			incomeID,
-		},
-		convertColumns(op.fields),
-	)
+
+	stringFields := convertColumns(op.fields)
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1",
+		strings.Join(stringFields, ", "), Table, IncomeID)
+
+	var data Data
+	var err error
+	if op.rtx != nil {
+		err = op.rtx.QueryRow(ctx, query, incomeID).Scan(data.fieldPtrs(op.fields)...)
+	} else {
+		err = op.f.db.QueryRow(ctx, query, incomeID).Scan(data.fieldPtrs(op.fields)...)
+	}
+
 	if err != nil {
-		op.f.logError("ReadRow", "Failed to ReadRow", logger.H{
+		op.f.logError("SingleRow", "Failed to QueryRow", logger.H{
 			"error":     err,
 			"fields":    op.fields,
 			"income_id": incomeID,
@@ -1588,118 +1614,156 @@ func (op *OperationRead) SingleRow(
 		return nil, err
 	}
 
-	var data Data
-	err = row.Columns(data.fieldPtrs(op.fields)...)
-	if err != nil {
-		op.f.logError("ReadRow", "Failed to Scan", logger.H{
-			"error":  err,
-			"fields": op.fields,
-		})
-		return nil, err
-	}
-
 	return &data, nil
 }
 
-type Muts struct {
-}
-
-var mutations = &Muts{}
-
-func (op *Muts) Create(data *Data) *spanner.Mutation {
-	return spanner.Insert(Table, allStringFields, GetValues(data))
-}
-
-// Put is an alias for spanner.InsertOrUpdate
-func (op Muts) Put(data *Data) *spanner.Mutation {
-	return spanner.InsertOrUpdate(Table, allStringFields, GetValues(data))
-}
-
-func (op *Muts) Delete(
-	incomeID string,
-) *spanner.Mutation {
-	return spanner.Delete(Table, spanner.Key{
-		incomeID,
-	})
-}
-
-func (op *Muts) Update(
-	incomeID string,
-	data UpdateFields,
-) *spanner.Mutation {
-	mutationData := map[string]interface{}{
-		IncomeID.String(): incomeID,
-	}
-	for field, value := range data {
-		mutationData[field.String()] = value
-	}
-
-	return spanner.UpdateMap(Table, mutationData)
-}
-
 type OperationWrite struct {
-	f    *Facade
-	muts []*spanner.Mutation
+	f       *Facade
+	creates []*Data
+	updates []updateOp
+	deletes []string
+	puts    []*Data
 }
 
-func (op *OperationWrite) apply(ctx context.Context, muts []*spanner.Mutation) error {
-	if _, err := op.f.db.Apply(ctx, muts); err != nil {
-		op.f.logError("OperationWrite Apply", "Failed to Apply", logger.H{
-			"error": err,
-			"muts":  muts,
-		})
-		return fmt.Errorf("failed to delete file record: %w", err)
-	}
-
-	return nil
+type updateOp struct {
+	incomeID string
+	data     UpdateFields
 }
 
 func (op *OperationWrite) Update(
 	incomeID string,
 	data UpdateFields,
 ) *OperationWrite {
-	op.muts = append(
-		op.muts,
-		mutations.Update(
-			incomeID,
-			data,
-		),
-	)
-
+	op.updates = append(op.updates, updateOp{
+		incomeID: incomeID,
+		data:     data,
+	})
 	return op
 }
 
 func (op *OperationWrite) Create(data *Data) *OperationWrite {
-	op.muts = append(op.muts, mutations.Create(data))
+	op.creates = append(op.creates, data)
 	return op
 }
 
-// Put is an alias for spanner.InsertOrUpdate
 func (op *OperationWrite) Put(data *Data) *OperationWrite {
-	op.muts = append(op.muts, mutations.Put(data))
+	op.puts = append(op.puts, data)
 	return op
 }
 
 func (op *OperationWrite) Apply(ctx context.Context) error {
-	return op.apply(ctx, op.muts)
+	tx, err := op.f.db.Begin(ctx)
+	if err != nil {
+		op.f.logError("OperationWrite Apply", "Failed to Begin transaction", logger.H{
+			"error": err,
+		})
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Execute creates
+	for _, data := range op.creates {
+		query := fmt.Sprintf("INSERT INTO %s (%s) VALUES ($1, $2, $3, $4, $5, $6)",
+			Table, strings.Join(allStringFields, ", "))
+		_, err := tx.Exec(ctx, query, GetValues(data)...)
+		if err != nil {
+			op.f.logError("OperationWrite Apply", "Failed to insert", logger.H{
+				"error": err,
+				"data":  data,
+			})
+			return err
+		}
+	}
+
+	// Execute puts (upserts)
+	for _, data := range op.puts {
+		query := fmt.Sprintf(`
+			INSERT INTO %s (%s)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (%s) DO UPDATE SET
+				%s = EXCLUDED.%s,
+				%s = EXCLUDED.%s,
+				%s = EXCLUDED.%s,
+				%s = EXCLUDED.%s,
+				%s = EXCLUDED.%s
+		`, Table,
+			strings.Join(allStringFields, ", "),
+			IncomeID,
+			IncomeName, IncomeName,
+			IncomeAmount, IncomeAmount,
+			IncomeType, IncomeType,
+			IncomeDate, IncomeDate,
+			CreatedAt, CreatedAt,
+		)
+		_, err := tx.Exec(ctx, query, GetValues(data)...)
+		if err != nil {
+			op.f.logError("OperationWrite Apply", "Failed to upsert", logger.H{
+				"error": err,
+				"data":  data,
+			})
+			return err
+		}
+	}
+
+	// Execute updates
+	for _, update := range op.updates {
+		if len(update.data) == 0 {
+			continue
+		}
+
+		setClauses := make([]string, 0, len(update.data))
+		args := make([]interface{}, 0, len(update.data)+1)
+		paramIdx := 1
+
+		for field, value := range update.data {
+			setClauses = append(setClauses, fmt.Sprintf("%s = $%d", field, paramIdx))
+			args = append(args, value)
+			paramIdx++
+		}
+		args = append(args, update.incomeID)
+
+		query := fmt.Sprintf("UPDATE %s SET %s WHERE %s = $%d",
+			Table, strings.Join(setClauses, ", "), IncomeID, paramIdx)
+
+		_, err := tx.Exec(ctx, query, args...)
+		if err != nil {
+			op.f.logError("OperationWrite Apply", "Failed to update", logger.H{
+				"error":     err,
+				"income_id": update.incomeID,
+				"data":      update.data,
+			})
+			return err
+		}
+	}
+
+	// Execute deletes
+	for _, incomeID := range op.deletes {
+		query := fmt.Sprintf("DELETE FROM %s WHERE %s = $1", Table, IncomeID)
+		_, err := tx.Exec(ctx, query, incomeID)
+		if err != nil {
+			op.f.logError("OperationWrite Apply", "Failed to delete", logger.H{
+				"error":     err,
+				"income_id": incomeID,
+			})
+			return err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		op.f.logError("OperationWrite Apply", "Failed to Commit transaction", logger.H{
+			"error": err,
+		})
+		return err
+	}
+
+	return nil
 }
 
 func (op *OperationWrite) Delete(
 	incomeID string,
 ) *OperationWrite {
-	op.muts = append(op.muts, mutations.Delete(
-		incomeID,
-	))
-
+	op.deletes = append(op.deletes, incomeID)
 	return op
-}
-
-func (op *OperationWrite) GetMuts() []*spanner.Mutation {
-	return op.muts
-}
-
-func Mut() *Muts {
-	return mutations
 }
 
 func (f *Facade) Read() *OperationRead {
@@ -1713,8 +1777,4 @@ func (f *Facade) Write() *OperationWrite {
 	return &OperationWrite{
 		f: f,
 	}
-}
-
-func (f *Facade) Muts() *Muts {
-	return mutations
 }

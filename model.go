@@ -4,46 +4,48 @@ import (
 	"context"
 	"fmt"
 
-	"cloud.google.com/go/spanner"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rsmrtk/db-fd-model/m_income"
 	"github.com/rsmrtk/db-fd-model/m_options"
 	"github.com/rsmrtk/smartlg/logger"
 )
 
-var (
-	defaultConfig = spanner.ClientConfig{
-		SessionPoolConfig: spanner.SessionPoolConfig{
-			MinOpened:          100,
-			MaxOpened:          2000,
-			MaxIdle:            200,
-			HealthCheckWorkers: 10,
-		},
-	}
-)
-
 type Model struct {
-	DB *spanner.Client
+	DB *pgxpool.Pool
 	//
 	Income *m_income.Facade
 }
 
 type Options struct {
-	SpannerUrl string
-	Log        *logger.Logger
+	PostgresURL string // PostgreSQL connection string (e.g., "postgres://user:pass@localhost:5432/dbname")
+	Log         *logger.Logger
 }
 
 func New(ctx context.Context, o *Options) (*Model, error) {
-	db, err := spanner.NewClientWithConfig(ctx, o.SpannerUrl, defaultConfig)
+	// Parse the connection string and create a pool config
+	config, err := pgxpool.ParseConfig(o.PostgresURL)
 	if err != nil {
-		o.Log.Error("Failed to create spanner client", logger.H{"error": err})
-		return nil, fmt.Errorf("failed to create spanner client: %w", err)
+		o.Log.Error("Failed to parse PostgreSQL connection string", logger.H{"error": err})
+		return nil, fmt.Errorf("failed to parse PostgreSQL connection string: %w", err)
 	}
 
+	// Configure connection pool settings
+	config.MinConns = 10
+	config.MaxConns = 100
+
+	// Create the connection pool
+	db, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		o.Log.Error("Failed to create PostgreSQL connection pool", logger.H{"error": err})
+		return nil, fmt.Errorf("failed to create PostgreSQL connection pool: %w", err)
+	}
+
+	// Test the connection
 	if err := ping(ctx, db); err != nil {
-		o.Log.Error("[PKG DB] Failed to ping spanner.", map[string]any{
+		o.Log.Error("[PKG DB] Failed to ping PostgreSQL.", map[string]any{
 			"error": err,
 		})
-		return nil, fmt.Errorf("failed to ping spanner: %w", err)
+		return nil, fmt.Errorf("failed to ping PostgreSQL: %w", err)
 	}
 
 	opt := &m_options.Options{
@@ -58,20 +60,21 @@ func New(ctx context.Context, o *Options) (*Model, error) {
 	}, nil
 }
 
-func ping(ctx context.Context, db *spanner.Client) error {
-	query := spanner.Statement{SQL: "SELECT 1"}
-
-	iter := db.Single().Query(ctx, query)
-	defer iter.Stop()
-	var testResult int64
-	if err := iter.Do(func(r *spanner.Row) error {
-		if r.Column(0, &testResult); testResult != 1 {
-			return fmt.Errorf("failed to ping spanner")
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("failed to ping spanner: %w", err)
+func ping(ctx context.Context, db *pgxpool.Pool) error {
+	var testResult int
+	err := db.QueryRow(ctx, "SELECT 1").Scan(&testResult)
+	if err != nil {
+		return fmt.Errorf("failed to ping PostgreSQL: %w", err)
 	}
-
+	if testResult != 1 {
+		return fmt.Errorf("unexpected ping result: %d", testResult)
+	}
 	return nil
+}
+
+// Close closes the database connection pool
+func (m *Model) Close() {
+	if m.DB != nil {
+		m.DB.Close()
+	}
 }
