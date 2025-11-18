@@ -8,8 +8,8 @@ import (
 // Builder is the main struct for constructing SQL queries.
 // All methods for building clauses are directly on this struct.
 type Builder[FieldType ~string] struct {
-	paramCount int // Counter for positional parameters in PostgreSQL
-	params     []any
+	params      map[string]any
+	paramWriter *strings.Builder
 
 	fields []FieldType // fields holds the selected columns for the query.
 
@@ -35,8 +35,8 @@ type AfterWhere[FieldType ~string] struct {
 // The 'initial' string parameter is currently unused.
 func New[FieldType ~string](initial string) *Builder[FieldType] {
 	sqlb := &Builder[FieldType]{
-		paramCount: 0,
-		params:     []any{},
+		params:      make(map[string]any),
+		paramWriter: &strings.Builder{},
 
 		selectClause:  &strings.Builder{},
 		fromClause:    &strings.Builder{},
@@ -52,43 +52,33 @@ func New[FieldType ~string](initial string) *Builder[FieldType] {
 }
 
 // writeColumnTo is an internal helper to write a column name (quoted) to a string builder.
-// For PostgreSQL, we use double quotes instead of backticks
 func (b *Builder[FieldType]) writeColumnTo(sb *strings.Builder, col FieldType) {
-	// PostgreSQL uses double quotes for identifiers
-	// We'll only quote if necessary (contains special characters or is a reserved word)
-	// For simplicity, we'll not quote by default unless needed
-	colStr := string(col)
-	// Check if column name needs quoting (contains spaces, special chars, or mixed case)
-	needsQuoting := false
-	for _, ch := range colStr {
-		if ch == ' ' || ch == '-' || ch == '.' || (ch >= 'A' && ch <= 'Z') {
-			needsQuoting = true
-			break
-		}
-	}
-
-	if needsQuoting {
-		sb.WriteString(`"`)
-		sb.WriteString(colStr)
-		sb.WriteString(`"`)
-	} else {
-		sb.WriteString(colStr)
-	}
+	sb.WriteString(`"`)
+	sb.WriteString(string(col))
+	sb.WriteString(`"`)
 }
 
 // addParam is an internal helper to add a parameter to the query and return its placeholder name.
-// For PostgreSQL, we use $1, $2, etc. instead of @paramName
 func (b *Builder[FieldType]) addParam(value any) string {
-	b.paramCount++
-	b.params = append(b.params, value)
-	return "$" + strconv.Itoa(b.paramCount)
+	b.paramWriter.WriteString("param")
+	b.paramWriter.WriteString(strconv.Itoa(len(b.params)))
+	paramKey := b.paramWriter.String()
+	b.paramWriter.Reset() // Reset for next param name generation
+
+	b.paramWriter.WriteString("@")
+	b.paramWriter.WriteString(paramKey)
+	paramName := b.paramWriter.String()
+	b.paramWriter.Reset() // Reset after generating full placeholder
+
+	b.params[paramKey] = value
+	return paramName
 }
 
 // Select starts or replaces the SELECT clause.
 func (b *Builder[FieldType]) Select(columns ...FieldType) *Builder[FieldType] {
 	sb := b.selectClause
 	sb.Reset() // Reset the select clause for a new SELECT statement
-	sb.WriteString("SELECT ")
+	sb.WriteString(" SELECT ")
 	for i, col := range columns {
 		if i > 0 {
 			sb.WriteString(", ")
@@ -193,14 +183,14 @@ func (b *Builder[FieldType]) OrUpper(col FieldType) *AfterWhere[FieldType] {
 	return b.afterWhere
 }
 
-// Eq adds an "= $n" condition to the WHERE clause.
+// Eq adds an "= @param" condition to the WHERE clause.
 func (b *AfterWhere[FieldType]) Eq(value any) *Builder[FieldType] {
 	b.whereClause.WriteString(" = ")
 	b.whereClause.WriteString(b.addParam(value))
 	return b.Builder
 }
 
-// Is adds an "IS $n" condition to the WHERE clause.
+// Is adds an "IS @param" condition to the WHERE clause.
 func (b *AfterWhere[FieldType]) Is(value any) *Builder[FieldType] {
 	b.whereClause.WriteString(" IS ")
 	b.whereClause.WriteString(b.addParam(value))
@@ -226,29 +216,22 @@ func (b *Builder[FieldType]) Or(col FieldType) *AfterWhere[FieldType] {
 	return b.afterWhere
 }
 
-// NotEqual adds a "!= $n" condition to the WHERE clause.
+// NotEqual adds a "!= @param" condition to the WHERE clause.
 func (b *AfterWhere[FieldType]) NotEqual(value any) *Builder[FieldType] {
 	b.whereClause.WriteString(" != ")
 	b.whereClause.WriteString(b.addParam(value))
 	return b.Builder
 }
 
-// Any adds an "= ANY($n)" condition to the WHERE clause (PostgreSQL array support).
-// This replaces Spanner's UNNEST functionality
-func (b *AfterWhere[FieldType]) Any(values any) *Builder[FieldType] {
-	b.whereClause.WriteString(" = ANY(")
+// Unnest adds an "IN UNNEST(@param)" condition to the WHERE clause.
+func (b *AfterWhere[FieldType]) Unnest(values any) *Builder[FieldType] {
+	b.whereClause.WriteString(" IN UNNEST(")
 	b.whereClause.WriteString(b.addParam(values))
 	b.whereClause.WriteString(")")
 	return b.Builder
 }
 
-// Unnest is deprecated for PostgreSQL, use Any instead
-// Keeping for backward compatibility but redirecting to Any
-func (b *AfterWhere[FieldType]) Unnest(values any) *Builder[FieldType] {
-	return b.Any(values)
-}
-
-// In adds an "IN ($1, $2, ...)" condition to the WHERE clause.
+// In adds an "IN (@param1, @param2, ...)" condition to the WHERE clause.
 func (b *AfterWhere[FieldType]) In(values ...any) *Builder[FieldType] {
 	if len(values) == 0 {
 		return b.Builder // Or handle error: IN clause requires at least one value
@@ -265,42 +248,42 @@ func (b *AfterWhere[FieldType]) In(values ...any) *Builder[FieldType] {
 	return b.Builder
 }
 
-// LessThan adds a "< $n" condition to the WHERE clause.
+// LessThan adds a "< @param" condition to the WHERE clause.
 func (b *AfterWhere[FieldType]) LessThan(value any) *Builder[FieldType] {
 	b.whereClause.WriteString(" < ")
 	b.whereClause.WriteString(b.addParam(value))
 	return b.Builder
 }
 
-// GrThan adds a "> $n" condition to the WHERE clause.
+// GrThan adds a "> @param" condition to the WHERE clause.
 func (b *AfterWhere[FieldType]) GrThan(value any) *Builder[FieldType] {
 	b.whereClause.WriteString(" > ")
 	b.whereClause.WriteString(b.addParam(value))
 	return b.Builder
 }
 
-// LessThanOrEq adds a "<= $n" condition to the WHERE clause.
+// LessThanOrEq adds a "<= @param" condition to the WHERE clause.
 func (b *AfterWhere[FieldType]) LessThanOrEq(value any) *Builder[FieldType] {
 	b.whereClause.WriteString(" <= ")
 	b.whereClause.WriteString(b.addParam(value))
 	return b.Builder
 }
 
-// GrThanOrEq adds a ">= $n" condition to the WHERE clause.
+// GrThanOrEq adds a ">= @param" condition to the WHERE clause.
 func (b *AfterWhere[FieldType]) GrThanOrEq(value any) *Builder[FieldType] {
 	b.whereClause.WriteString(" >= ")
 	b.whereClause.WriteString(b.addParam(value))
 	return b.Builder
 }
 
-// Like adds a "LIKE $n" condition to the WHERE clause.
+// Like adds a "LIKE @param" condition to the WHERE clause.
 func (b *AfterWhere[FieldType]) Like(pattern any) *Builder[FieldType] {
 	b.whereClause.WriteString(" LIKE ")
 	b.whereClause.WriteString(b.addParam(pattern))
 	return b.Builder
 }
 
-// LikeLower adds a "LIKE LOWER($n)" condition to the WHERE clause.
+// LikeLower adds a "LIKE LOWER(@param)" condition to the WHERE clause.
 // This implies the column being compared should also be LOWERed, e.g., WhereLower(col).LikeLower(pattern)
 func (b *AfterWhere[FieldType]) LikeLower(pattern any) *Builder[FieldType] {
 	wc := b.whereClause
@@ -310,7 +293,7 @@ func (b *AfterWhere[FieldType]) LikeLower(pattern any) *Builder[FieldType] {
 	return b.Builder
 }
 
-// Between adds a "BETWEEN $n AND $m" condition to the WHERE clause.
+// Between adds a "BETWEEN @param1 AND @param2" condition to the WHERE clause.
 func (b *AfterWhere[FieldType]) Between(val1 any, val2 any) *Builder[FieldType] {
 	wc := b.whereClause
 	wc.WriteString(" BETWEEN ")
@@ -333,9 +316,27 @@ func (b *Builder[FieldType]) GroupBy(col FieldType, cols ...FieldType) *Builder[
 	return b
 }
 
-// ThenBy adds another column to the ORDER BY clause.
-// Call after OrderBy.
+// ThenBy (for GroupBy) adds another column to the GROUP BY clause.
+// Call after GroupBy.
 func (b *Builder[FieldType]) ThenBy(col FieldType) *Builder[FieldType] {
+	// This method name is now ambiguous, better to have specific ThenByGroupBy or ThenByOrderBy
+	// For now, assuming it's for GroupBy if called without OrderBy first, or make it specific.
+	// Let's assume this is ThenBy for GroupBy for now, if groupByClause is active.
+	// A more robust API would differentiate.
+	// This implementation will just append to groupByClause if it's not empty.
+	if b.groupByClause.Len() > 0 {
+		b.groupByClause.WriteString(", ")
+		b.writeColumnTo(b.groupByClause, col)
+	}
+	// If you want this to be ThenBy for OrderBy, it should append to orderByClause.
+	// To avoid ambiguity, it's better to have distinct ThenByGroupBy and ThenByOrderBy methods.
+	// For this refactor, I'll keep a single ThenBy and it will append to GroupBy if GroupBy was started.
+	// If OrderBy was started and GroupBy was not, it could append to OrderBy. This is messy.
+
+	// Corrected approach: ThenBy should be context-aware or we need separate methods.
+	// Given the simplification, let's make ThenBy apply to OrderBy as it's more common.
+	// If you need ThenBy for GroupBy, you can call GroupBy with multiple columns.
+	// So, this ThenBy will target orderByClause.
 	if b.orderByClause.Len() > 0 { // Check if ORDER BY clause has been started
 		b.orderByClause.WriteString(", ")
 		b.writeColumnTo(b.orderByClause, col)
@@ -410,19 +411,8 @@ func (b *Builder[FieldType]) String() string {
 		b.offsetClause.String()
 }
 
-// Params returns the parameters in order for PostgreSQL
-func (b *Builder[FieldType]) Params() []any {
+func (b *Builder[FieldType]) Params() map[string]any {
 	return b.params
-}
-
-// ParamsMap returns parameters as a map (for backward compatibility)
-// Note: This is less useful for PostgreSQL which uses positional parameters
-func (b *Builder[FieldType]) ParamsMap() map[string]any {
-	result := make(map[string]any)
-	for i, param := range b.params {
-		result["param"+strconv.Itoa(i+1)] = param
-	}
-	return result
 }
 
 func (b *Builder[FieldType]) Fields() []FieldType {
@@ -430,6 +420,33 @@ func (b *Builder[FieldType]) Fields() []FieldType {
 		return nil // Return nil if no fields were selected
 	}
 	return b.fields
+}
+
+// StringPostgres returns the SQL query string with PostgreSQL-style placeholders ($1, $2, etc.)
+func (b *Builder[FieldType]) StringPostgres() string {
+	queryStr := b.String()
+
+	// Replace @paramN with $N for PostgreSQL
+	for i := 0; i < len(b.params); i++ {
+		old := "@param" + strconv.Itoa(i)
+		new := "$" + strconv.Itoa(i+1)
+		queryStr = strings.Replace(queryStr, old, new, -1)
+	}
+
+	// Handle UNNEST for PostgreSQL (convert to regular IN)
+	queryStr = strings.Replace(queryStr, " IN UNNEST(", " = ANY(", -1)
+
+	return queryStr
+}
+
+// ArgsPostgres returns the query arguments in the correct order for PostgreSQL
+func (b *Builder[FieldType]) ArgsPostgres() []interface{} {
+	args := make([]interface{}, len(b.params))
+	for i := 0; i < len(b.params); i++ {
+		key := "param" + strconv.Itoa(i)
+		args[i] = b.params[key]
+	}
+	return args
 }
 
 func (b *Builder[FieldType]) Reset() *Builder[FieldType] {
@@ -444,7 +461,9 @@ func (b *Builder[FieldType]) Reset() *Builder[FieldType] {
 	b.limitClause.Reset()
 	b.offsetClause.Reset()
 
-	b.paramCount = 0
-	b.params = []any{}
+	b.params = make(map[string]any)
+	if b.paramWriter != nil {
+		b.paramWriter.Reset()
+	}
 	return b
 }
