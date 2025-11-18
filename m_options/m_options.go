@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/rsmrtk/log/logger"
+	"github.com/rsmrtk/smartlg/logger"
 )
 
 type Options struct {
