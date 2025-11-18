@@ -1,4 +1,4 @@
-VERSION=v1.0.8
+VERSION=v1.0.9
 
 release:
 	echo "Only create it after you push the changes to the repository # master"

@@ -4,7 +4,6 @@ go 1.25.3
 
 require (
 	github.com/jackc/pgx/v5 v5.7.6
-	github.com/lib/pq v1.10.9
 	github.com/rsmrtk/smartlg v0.0.0-20250805062650-c308cfd6bb3f
 )
 

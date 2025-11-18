@@ -1,15 +1,15 @@
 package m_options
 
 import (
-	"database/sql"
 	"fmt"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rsmrtk/smartlg/logger"
 )
 
 type Options struct {
 	Log *logger.Logger
-	DB  *sql.DB
+	DB  *pgxpool.Pool
 }
 
 func (o Options) IsValid() error {

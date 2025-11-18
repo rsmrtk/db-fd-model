@@ -572,10 +572,17 @@ func (c *Facade) GetByBuilder(ctx context.Context, builder *sql_builder.Builder[
 		return nil, fmt.Errorf("builder cannot be nil")
 	}
 	queryStr := builder.String()
-	queryParams := builder.Params()
+	paramsMap := builder.Params()
 	fields := builder.Fields()
 
-	rows, err := c.db.Query(ctx, queryStr, queryParams...)
+	// Convert map params to ordered slice
+	args := make([]interface{}, len(paramsMap))
+	for i := 0; i < len(paramsMap); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args[i] = paramsMap[paramName]
+	}
+
+	rows, err := c.db.Query(ctx, queryStr, args...)
 	if err != nil {
 		c.logError("GetByBuilder", "Failed to Query", logger.H{
 			"error":  err,
@@ -610,10 +617,17 @@ func (c *Facade) GetByBuilderRtx(ctx context.Context, rtx pgx.Tx, builder *sql_b
 		return nil, fmt.Errorf("builder cannot be nil")
 	}
 	queryStr := builder.String()
-	queryParams := builder.Params()
+	paramsMap := builder.Params()
 	fields := builder.Fields()
 
-	rows, err := rtx.Query(ctx, queryStr, queryParams...)
+	// Convert map params to ordered slice
+	args := make([]interface{}, len(paramsMap))
+	for i := 0; i < len(paramsMap); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args[i] = paramsMap[paramName]
+	}
+
+	rows, err := rtx.Query(ctx, queryStr, args...)
 	if err != nil {
 		c.logError("GetByBuilderRtx", "Failed to Query", logger.H{
 			"error":  err,
@@ -648,10 +662,17 @@ func (c *Facade) GetByBuilderTx(ctx context.Context, tx pgx.Tx, builder *sql_bui
 		return nil, fmt.Errorf("builder cannot be nil")
 	}
 	queryStr := builder.String()
-	queryParams := builder.Params()
+	paramsMap := builder.Params()
 	fields := builder.Fields()
 
-	rows, err := tx.Query(ctx, queryStr, queryParams...)
+	// Convert map params to ordered slice
+	args := make([]interface{}, len(paramsMap))
+	for i := 0; i < len(paramsMap); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args[i] = paramsMap[paramName]
+	}
+
+	rows, err := tx.Query(ctx, queryStr, args...)
 	if err != nil {
 		c.logError("GetByBuilderTx", "Failed to Query", logger.H{
 			"error":  err,
@@ -686,10 +707,17 @@ func (c *Facade) GetByBuilderIter(ctx context.Context, builder *sql_builder.Buil
 		return fmt.Errorf("builder cannot be nil")
 	}
 	queryStr := builder.String()
-	queryParams := builder.Params()
+	paramsMap := builder.Params()
 	fields := builder.Fields()
 
-	rows, err := c.db.Query(ctx, queryStr, queryParams...)
+	// Convert map params to ordered slice
+	args := make([]interface{}, len(paramsMap))
+	for i := 0; i < len(paramsMap); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args[i] = paramsMap[paramName]
+	}
+
+	rows, err := c.db.Query(ctx, queryStr, args...)
 	if err != nil {
 		c.logError("GetByBuilderIter", "Failed to Query", logger.H{
 			"error":  err,
@@ -723,10 +751,17 @@ func (c *Facade) GetByBuilderRtxIter(ctx context.Context, rtx pgx.Tx, builder *s
 		return fmt.Errorf("builder cannot be nil")
 	}
 	queryStr := builder.String()
-	queryParams := builder.Params()
+	paramsMap := builder.Params()
 	fields := builder.Fields()
 
-	rows, err := rtx.Query(ctx, queryStr, queryParams...)
+	// Convert map params to ordered slice
+	args := make([]interface{}, len(paramsMap))
+	for i := 0; i < len(paramsMap); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args[i] = paramsMap[paramName]
+	}
+
+	rows, err := rtx.Query(ctx, queryStr, args...)
 	if err != nil {
 		c.logError("GetByBuilderRtxIter", "Failed to Query", logger.H{
 			"error":  err,
@@ -760,10 +795,17 @@ func (c *Facade) GetByBuilderTxIter(ctx context.Context, tx pgx.Tx, builder *sql
 		return fmt.Errorf("builder cannot be nil")
 	}
 	queryStr := builder.String()
-	queryParams := builder.Params()
+	paramsMap := builder.Params()
 	fields := builder.Fields()
 
-	rows, err := tx.Query(ctx, queryStr, queryParams...)
+	// Convert map params to ordered slice
+	args := make([]interface{}, len(paramsMap))
+	for i := 0; i < len(paramsMap); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args[i] = paramsMap[paramName]
+	}
+
+	rows, err := tx.Query(ctx, queryStr, args...)
 	if err != nil {
 		c.logError("GetByBuilderTxIter", "Failed to Query", logger.H{
 			"error":  err,
@@ -1468,21 +1510,28 @@ func (op *OperationRead) GetCount(ctx context.Context) (int64, error) {
 	}
 
 	queryStr := op.qb.String()
-	queryParams := op.qb.Params()
+	paramsMap := op.qb.Params()
+
+	// Convert map params to ordered slice
+	args := make([]interface{}, len(paramsMap))
+	for i := 0; i < len(paramsMap); i++ {
+		paramName := fmt.Sprintf("param%d", i)
+		args[i] = paramsMap[paramName]
+	}
 
 	var count int64
 	var err error
 	if op.rtx != nil {
-		err = op.rtx.QueryRow(ctx, queryStr, queryParams...).Scan(&count)
+		err = op.rtx.QueryRow(ctx, queryStr, args...).Scan(&count)
 	} else {
-		err = op.f.db.QueryRow(ctx, queryStr, queryParams...).Scan(&count)
+		err = op.f.db.QueryRow(ctx, queryStr, args...).Scan(&count)
 	}
 
 	if err != nil {
 		op.f.logError("GetCount", "Failed to Scan", logger.H{
 			"error": err,
 			"query": queryStr,
-			"param": queryParams,
+			"param": paramsMap,
 		})
 		return 0, err
 	}
@@ -1513,11 +1562,19 @@ func (op *OperationRead) Rows(ctx context.Context) ([]*Data, error) {
 		}
 	case byBuilder:
 		queryStr := op.qb.String()
-		queryParams := op.qb.Params()
+		paramsMap := op.qb.Params()
+
+		// Convert map params to ordered slice
+		args := make([]interface{}, len(paramsMap))
+		for i := 0; i < len(paramsMap); i++ {
+			paramName := fmt.Sprintf("param%d", i)
+			args[i] = paramsMap[paramName]
+		}
+
 		if op.rtx != nil {
-			rows, err = op.rtx.Query(ctx, queryStr, queryParams...)
+			rows, err = op.rtx.Query(ctx, queryStr, args...)
 		} else {
-			rows, err = op.f.db.Query(ctx, queryStr, queryParams...)
+			rows, err = op.f.db.Query(ctx, queryStr, args...)
 		}
 	case byParams:
 		queryString := SelectQuery(op.fields)

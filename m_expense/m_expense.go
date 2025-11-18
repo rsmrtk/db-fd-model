@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/rsmrtk/db-fd-model/m_options"
 	"github.com/rsmrtk/db-fd-model/sql_builder"
 	"github.com/rsmrtk/smartlg/logger"
@@ -25,9 +26,11 @@ type Facade struct {
 }
 
 func New(o *m_options.Options) *Facade {
+	// Convert pgxpool.Pool to sql.DB using stdlib
+	sqlDB := stdlib.OpenDBFromPool(o.DB)
 	return &Facade{
 		log: o.Log,
-		db:  o.DB,
+		db:  sqlDB,
 		//
 	}
 }
