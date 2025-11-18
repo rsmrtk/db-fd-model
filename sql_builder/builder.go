@@ -53,9 +53,9 @@ func New[FieldType ~string](initial string) *Builder[FieldType] {
 
 // writeColumnTo is an internal helper to write a column name (quoted) to a string builder.
 func (b *Builder[FieldType]) writeColumnTo(sb *strings.Builder, col FieldType) {
-	sb.WriteString("`")
+	sb.WriteString(`"`)
 	sb.WriteString(string(col))
-	sb.WriteString("`")
+	sb.WriteString(`"`)
 }
 
 // addParam is an internal helper to add a parameter to the query and return its placeholder name.
@@ -420,6 +420,33 @@ func (b *Builder[FieldType]) Fields() []FieldType {
 		return nil // Return nil if no fields were selected
 	}
 	return b.fields
+}
+
+// StringPostgres returns the SQL query string with PostgreSQL-style placeholders ($1, $2, etc.)
+func (b *Builder[FieldType]) StringPostgres() string {
+	queryStr := b.String()
+
+	// Replace @paramN with $N for PostgreSQL
+	for i := 0; i < len(b.params); i++ {
+		old := "@param" + strconv.Itoa(i)
+		new := "$" + strconv.Itoa(i+1)
+		queryStr = strings.Replace(queryStr, old, new, -1)
+	}
+
+	// Handle UNNEST for PostgreSQL (convert to regular IN)
+	queryStr = strings.Replace(queryStr, " IN UNNEST(", " = ANY(", -1)
+
+	return queryStr
+}
+
+// ArgsPostgres returns the query arguments in the correct order for PostgreSQL
+func (b *Builder[FieldType]) ArgsPostgres() []interface{} {
+	args := make([]interface{}, len(b.params))
+	for i := 0; i < len(b.params); i++ {
+		key := "param" + strconv.Itoa(i)
+		args[i] = b.params[key]
+	}
+	return args
 }
 
 func (b *Builder[FieldType]) Reset() *Builder[FieldType] {

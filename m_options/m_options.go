@@ -1,15 +1,15 @@
 package m_options
 
 import (
+	"database/sql"
 	"fmt"
 
-	"cloud.google.com/go/spanner"
 	"github.com/rsmrtk/smartlg/logger"
 )
 
 type Options struct {
 	Log *logger.Logger
-	DB  *spanner.Client
+	DB  *sql.DB
 }
 
 func (o Options) IsValid() error {

@@ -2,48 +2,77 @@ package db_fd_model
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"time"
 
-	"cloud.google.com/go/spanner"
+	"github.com/rsmrtk/db-fd-model/m_expense"
 	"github.com/rsmrtk/db-fd-model/m_income"
 	"github.com/rsmrtk/db-fd-model/m_options"
 	"github.com/rsmrtk/smartlg/logger"
-)
 
-var (
-	defaultConfig = spanner.ClientConfig{
-		SessionPoolConfig: spanner.SessionPoolConfig{
-			MinOpened:          100,
-			MaxOpened:          2000,
-			MaxIdle:            200,
-			HealthCheckWorkers: 10,
-		},
-	}
+	// PostgreSQL driver
+	_ "github.com/lib/pq"
 )
 
 type Model struct {
-	DB *spanner.Client
+	DB *sql.DB
 	//
-	Income *m_income.Facade
+	Expense *m_expense.Facade
+	Income  *m_income.Facade
 }
 
 type Options struct {
-	SpannerUrl string
-	Log        *logger.Logger
+	PostgresURL string // Format: "postgres://user:password@host:port/dbname?sslmode=disable"
+	Log         *logger.Logger
+
+	// Optional connection pool settings
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+	ConnMaxIdleTime time.Duration
 }
 
 func New(ctx context.Context, o *Options) (*Model, error) {
-	db, err := spanner.NewClientWithConfig(ctx, o.SpannerUrl, defaultConfig)
+	// Open PostgreSQL connection
+	db, err := sql.Open("postgres", o.PostgresURL)
 	if err != nil {
-		o.Log.Error("Failed to create spanner client", logger.H{"error": err})
-		return nil, fmt.Errorf("failed to create spanner client: %w", err)
+		o.Log.Error("Failed to open PostgreSQL connection", logger.H{"error": err})
+		return nil, fmt.Errorf("failed to open PostgreSQL connection: %w", err)
 	}
 
+	// Configure connection pool
+	if o.MaxOpenConns > 0 {
+		db.SetMaxOpenConns(o.MaxOpenConns)
+	} else {
+		db.SetMaxOpenConns(25) // Default
+	}
+
+	if o.MaxIdleConns > 0 {
+		db.SetMaxIdleConns(o.MaxIdleConns)
+	} else {
+		db.SetMaxIdleConns(5) // Default
+	}
+
+	if o.ConnMaxLifetime > 0 {
+		db.SetConnMaxLifetime(o.ConnMaxLifetime)
+	} else {
+		db.SetConnMaxLifetime(5 * time.Minute) // Default
+	}
+
+	if o.ConnMaxIdleTime > 0 {
+		db.SetConnMaxIdleTime(o.ConnMaxIdleTime)
+	} else {
+		db.SetConnMaxIdleTime(90 * time.Second) // Default
+	}
+
+	// Test connection
 	if err := ping(ctx, db); err != nil {
-		o.Log.Error("[PKG DB] Failed to ping spanner.", map[string]any{
+		o.Log.Error("[PKG DB] Failed to ping PostgreSQL.", map[string]any{
 			"error": err,
 		})
-		return nil, fmt.Errorf("failed to ping spanner: %w", err)
+		db.Close()
+		return nil, fmt.Errorf("failed to ping PostgreSQL: %w", err)
 	}
 
 	opt := &m_options.Options{
@@ -54,24 +83,45 @@ func New(ctx context.Context, o *Options) (*Model, error) {
 	return &Model{
 		DB: db,
 		//
-		Income: m_income.New(opt),
+		Expense: m_expense.New(opt),
+		Income:  m_income.New(opt),
 	}, nil
 }
 
-func ping(ctx context.Context, db *spanner.Client) error {
-	query := spanner.Statement{SQL: "SELECT 1"}
+func ping(ctx context.Context, db *sql.DB) error {
+	// Use PingContext to verify connection
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("failed to ping database: %w", err)
+	}
 
-	iter := db.Single().Query(ctx, query)
-	defer iter.Stop()
-	var testResult int64
-	if err := iter.Do(func(r *spanner.Row) error {
-		if r.Column(0, &testResult); testResult != 1 {
-			return fmt.Errorf("failed to ping spanner")
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("failed to ping spanner: %w", err)
+	// Additional test query
+	var testResult int
+	err := db.QueryRowContext(ctx, "SELECT 1").Scan(&testResult)
+	if err != nil {
+		return fmt.Errorf("failed to execute test query: %w", err)
+	}
+
+	if testResult != 1 {
+		return fmt.Errorf("unexpected test query result: %d", testResult)
 	}
 
 	return nil
+}
+
+// Close closes the database connection
+func (m *Model) Close() error {
+	if m.DB != nil {
+		return m.DB.Close()
+	}
+	return nil
+}
+
+// BeginTx starts a new transaction
+func (m *Model) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+	return m.DB.BeginTx(ctx, opts)
+}
+
+// Begin starts a new transaction with default options
+func (m *Model) Begin() (*sql.Tx, error) {
+	return m.DB.Begin()
 }
